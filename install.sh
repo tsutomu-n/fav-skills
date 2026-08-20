@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly LOCK_FILE="${SCRIPT_DIR}/skills.lock"
+readonly REMOTE_LOCK_FILE="${SCRIPT_DIR}/skills.lock"
+readonly BUNDLED_LOCK_FILE="${SCRIPT_DIR}/bundled-skills.lock"
 readonly DEFAULT_TARGET="${HOME}/.agents/skills"
 
 TARGET_DIR="${CODEX_SKILLS_DIR:-$DEFAULT_TARGET}"
@@ -11,13 +12,19 @@ TMP_DIR=""
 BACKUP_DIR=""
 ROLLBACK=0
 
-declare -a SKILL_NAMES=()
-declare -a SKILL_OWNERS=()
-declare -a SKILL_GISTS=()
-declare -a SKILL_REVISIONS=()
-declare -a SKILL_FILES=()
+declare -a REMOTE_NAMES=()
+declare -a REMOTE_OWNERS=()
+declare -a REMOTE_GISTS=()
+declare -a REMOTE_REVISIONS=()
+declare -a REMOTE_FILES=()
+declare -a BUNDLED_NAMES=()
+declare -a BUNDLED_PATHS=()
+declare -a ALL_NAMES=()
 declare -a EXISTING_NAMES=()
+declare -a UP_TO_DATE_NAMES=()
+declare -a PENDING_NAMES=()
 declare -a INSTALLED_NAMES=()
+declare -A SEEN_NAMES=()
 
 usage() {
   cat <<'USAGE'
@@ -76,6 +83,62 @@ on_exit() {
 }
 trap 'on_exit $?' EXIT
 
+add_skill_name() {
+  local name="$1"
+
+  [[ "$name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "不正なスキル名です: $name"
+  [[ -z "${SEEN_NAMES[$name]+x}" ]] || die "スキル名が重複しています: $name"
+
+  SEEN_NAMES["$name"]=1
+  ALL_NAMES+=("$name")
+}
+
+validate_skill() {
+  local expected_name="$1"
+  local path="$2"
+  local size header
+
+  [[ -s "$path" ]] || die "SKILL.mdが空です: $expected_name"
+  size="$(wc -c < "$path")"
+  (( size <= 1048576 )) || die "SKILL.mdが1MiBを超えています: $expected_name"
+  [[ "$(sed -n '1p' "$path")" == '---' ]] || die "YAML front matterがありません: $expected_name"
+
+  header="$(awk 'NR == 1 { next } /^---[[:space:]]*$/ { exit } { print }' "$path")"
+  grep -Eq "^name:[[:space:]]*${expected_name}[[:space:]]*$" <<< "$header" \
+    || die "SKILL.mdのnameが一致しません: $expected_name"
+  grep -Eq '^description:[[:space:]]*[^[:space:]].*$' <<< "$header" \
+    || die "SKILL.mdにdescriptionがありません: $expected_name"
+}
+
+directories_equal() {
+  local left="$1"
+  local right="$2"
+  local relative left_mode right_mode
+
+  [[ -d "$left" && ! -L "$left" && -d "$right" && ! -L "$right" ]] || return 1
+  diff -qr -- "$left" "$right" >/dev/null || return 1
+
+  while IFS= read -r relative; do
+    left_mode="$(stat -c '%a' "${left}/${relative}")"
+    right_mode="$(stat -c '%a' "${right}/${relative}")"
+    [[ "$left_mode" == "$right_mode" ]] || return 1
+  done < <(cd -- "$right" && find . -type f -printf '%P\n' | LC_ALL=C sort)
+
+  return 0
+}
+
+print_next_steps() {
+  cat <<'NEXT'
+
+Codexを起動中なら再起動し、/skills で確認してください。
+スキルは暗黙には発動しません。プロンプトで明示的に指定します。
+
+  $japanese-tech-writing を使って、この文書を推敲してください。
+  $cognitive-rhythm-writing を使って、この解説文のリズムを調整してください。
+  $tabler-icons を使って、このUIに合うTabler Iconを実在確認して実装してください。
+NEXT
+}
+
 while (( $# > 0 )); do
   case "$1" in
     --force)
@@ -101,40 +164,44 @@ if [[ "${EUID:-$(id -u)}" -eq 0 && -n "${SUDO_USER:-}" ]]; then
   die 'sudoで実行しないでください。通常ユーザーで ./install.sh を実行してください。'
 fi
 
-[[ -r "$LOCK_FILE" ]] || die "skills.lockを読み込めません: $LOCK_FILE"
+[[ -r "$REMOTE_LOCK_FILE" ]] || die "skills.lockを読み込めません: $REMOTE_LOCK_FILE"
+[[ -r "$BUNDLED_LOCK_FILE" ]] || die "bundled-skills.lockを読み込めません: $BUNDLED_LOCK_FILE"
 
 while IFS='|' read -r name owner gist revision filename extra; do
   [[ -z "$name" || "$name" == \#* ]] && continue
   [[ -z "${extra:-}" ]] || die "skills.lockの列数が不正です: $name"
-  [[ "$name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "不正なスキル名です: $name"
+  add_skill_name "$name"
   [[ "$owner" =~ ^[A-Za-z0-9-]+$ ]] || die "不正なGist所有者です: $owner"
   [[ "$gist" =~ ^[0-9a-f]{32}$ ]] || die "不正なGist IDです: $gist"
   [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || die "不正なリビジョンです: $revision"
   [[ "$filename" == 'SKILL.md' ]] || die "未対応のファイル名です: $filename"
 
-  SKILL_NAMES+=("$name")
-  SKILL_OWNERS+=("$owner")
-  SKILL_GISTS+=("$gist")
-  SKILL_REVISIONS+=("$revision")
-  SKILL_FILES+=("$filename")
-done < "$LOCK_FILE"
+  REMOTE_NAMES+=("$name")
+  REMOTE_OWNERS+=("$owner")
+  REMOTE_GISTS+=("$gist")
+  REMOTE_REVISIONS+=("$revision")
+  REMOTE_FILES+=("$filename")
+done < "$REMOTE_LOCK_FILE"
 
-(( ${#SKILL_NAMES[@]} > 0 )) || die 'skills.lockにスキルがありません。'
+while IFS='|' read -r name relative_path extra; do
+  [[ -z "$name" || "$name" == \#* ]] && continue
+  [[ -z "${extra:-}" ]] || die "bundled-skills.lockの列数が不正です: $name"
+  add_skill_name "$name"
+  [[ "$relative_path" == "skills/${name}" ]] \
+    || die "同梱スキルのパスが不正です: ${name}|${relative_path}"
+  [[ -d "${SCRIPT_DIR}/${relative_path}" ]] \
+    || die "同梱スキルのディレクトリがありません: $relative_path"
+  [[ -z "$(find "${SCRIPT_DIR}/${relative_path}" -type l -print -quit)" ]] \
+    || die "同梱スキル内のシンボリックリンクは許可していません: $relative_path"
+
+  BUNDLED_NAMES+=("$name")
+  BUNDLED_PATHS+=("$relative_path")
+done < "$BUNDLED_LOCK_FILE"
+
+(( ${#ALL_NAMES[@]} > 0 )) || die 'インストール対象のスキルがありません。'
 
 mkdir -p -- "$TARGET_DIR"
 TARGET_DIR="$(cd -- "$TARGET_DIR" && pwd -P)"
-
-for name in "${SKILL_NAMES[@]}"; do
-  if [[ -e "${TARGET_DIR}/${name}" || -L "${TARGET_DIR}/${name}" ]]; then
-    EXISTING_NAMES+=("$name")
-  fi
-done
-
-if (( ${#EXISTING_NAMES[@]} > 0 && FORCE == 0 )); then
-  printf '[fav-skills] 次のスキルは既に存在します:\n' >&2
-  printf '  - %s\n' "${EXISTING_NAMES[@]}" >&2
-  die '置換する場合は ./install.sh --force を実行してください。'
-fi
 
 if command -v curl >/dev/null 2>&1; then
   download() {
@@ -150,32 +217,15 @@ else
   die 'curlまたはwgetが必要です。'
 fi
 
-validate_skill() {
-  local expected_name="$1"
-  local path="$2"
-  local size header
-
-  [[ -s "$path" ]] || die "ダウンロードしたファイルが空です: $expected_name"
-  size="$(wc -c < "$path")"
-  (( size <= 1048576 )) || die "SKILL.mdが1MiBを超えています: $expected_name"
-  [[ "$(sed -n '1p' "$path")" == '---' ]] || die "YAML front matterがありません: $expected_name"
-
-  header="$(awk 'NR == 1 { next } /^---[[:space:]]*$/ { exit } { print }' "$path")"
-  grep -Eq "^name:[[:space:]]*${expected_name}[[:space:]]*$" <<< "$header" \
-    || die "SKILL.mdのnameが一致しません: $expected_name"
-  grep -Eq '^description:[[:space:]]*[^[:space:]].*$' <<< "$header" \
-    || die "SKILL.mdにdescriptionがありません: $expected_name"
-}
-
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fav-skills.XXXXXXXX")"
 mkdir -p -- "${TMP_DIR}/stage"
 
-for index in "${!SKILL_NAMES[@]}"; do
-  name="${SKILL_NAMES[$index]}"
-  owner="${SKILL_OWNERS[$index]}"
-  gist="${SKILL_GISTS[$index]}"
-  revision="${SKILL_REVISIONS[$index]}"
-  filename="${SKILL_FILES[$index]}"
+for index in "${!REMOTE_NAMES[@]}"; do
+  name="${REMOTE_NAMES[$index]}"
+  owner="${REMOTE_OWNERS[$index]}"
+  gist="${REMOTE_GISTS[$index]}"
+  revision="${REMOTE_REVISIONS[$index]}"
+  filename="${REMOTE_FILES[$index]}"
   skill_dir="${TMP_DIR}/stage/${name}"
   url="https://gist.githubusercontent.com/${owner}/${gist}/raw/${revision}/${filename}"
 
@@ -191,10 +241,58 @@ YAML
   chmod 0644 "${skill_dir}/SKILL.md" "${skill_dir}/agents/openai.yaml"
 done
 
+for index in "${!BUNDLED_NAMES[@]}"; do
+  name="${BUNDLED_NAMES[$index]}"
+  relative_path="${BUNDLED_PATHS[$index]}"
+  source_dir="${SCRIPT_DIR}/${relative_path}"
+  skill_dir="${TMP_DIR}/stage/${name}"
+
+  log "同梱スキルを準備中: ${name}"
+  mkdir -p -- "$skill_dir"
+  cp -a -- "${source_dir}/." "$skill_dir/"
+  validate_skill "$name" "${skill_dir}/SKILL.md"
+
+  if [[ -d "${skill_dir}/scripts" ]]; then
+    find "${skill_dir}/scripts" -type f -name '*.mjs' -exec chmod 0755 {} +
+  fi
+done
+
 if [[ -f "${TMP_DIR}/stage/cognitive-rhythm-writing/SKILL.md" ]]; then
   grep -Fq '../japanese-tech-writing/SKILL.md' \
     "${TMP_DIR}/stage/cognitive-rhythm-writing/SKILL.md" \
     || die 'cognitive-rhythm-writingの基礎スキル参照を確認できません。'
+fi
+
+for name in "${ALL_NAMES[@]}"; do
+  installed_path="${TARGET_DIR}/${name}"
+  staged_path="${TMP_DIR}/stage/${name}"
+
+  if [[ -e "$installed_path" || -L "$installed_path" ]]; then
+    if directories_equal "$installed_path" "$staged_path"; then
+      UP_TO_DATE_NAMES+=("$name")
+    else
+      EXISTING_NAMES+=("$name")
+      PENDING_NAMES+=("$name")
+    fi
+  else
+    PENDING_NAMES+=("$name")
+  fi
+done
+
+if (( ${#EXISTING_NAMES[@]} > 0 && FORCE == 0 )); then
+  printf '[fav-skills] 次のスキルは既存内容と異なります:\n' >&2
+  printf '  - %s\n' "${EXISTING_NAMES[@]}" >&2
+  die '置換する場合は ./install.sh --force を実行してください。'
+fi
+
+for name in "${UP_TO_DATE_NAMES[@]}"; do
+  log "既に最新です: $name"
+done
+
+if (( ${#PENDING_NAMES[@]} == 0 )); then
+  log "インストール先: $TARGET_DIR"
+  print_next_steps
+  exit 0
 fi
 
 ROLLBACK=1
@@ -209,7 +307,7 @@ if (( ${#EXISTING_NAMES[@]} > 0 )); then
   done
 fi
 
-for name in "${SKILL_NAMES[@]}"; do
+for name in "${PENDING_NAMES[@]}"; do
   mv -- "${TMP_DIR}/stage/${name}" "${TARGET_DIR}/${name}"
   INSTALLED_NAMES+=("$name")
 done
@@ -217,7 +315,7 @@ done
 ROLLBACK=0
 
 log "インストール先: $TARGET_DIR"
-for name in "${SKILL_NAMES[@]}"; do
+for name in "${INSTALLED_NAMES[@]}"; do
   log "インストール完了: $name"
 done
 
@@ -225,11 +323,4 @@ if [[ -n "$BACKUP_DIR" ]]; then
   log "既存スキルのバックアップ: $BACKUP_DIR"
 fi
 
-cat <<'NEXT'
-
-Codexを起動中なら再起動し、/skills で確認してください。
-スキルは暗黙には発動しません。プロンプトで明示的に指定します。
-
-  $japanese-tech-writing を使って、この文書を推敲してください。
-  $cognitive-rhythm-writing を使って、この解説文のリズムを調整してください。
-NEXT
+print_next_steps
