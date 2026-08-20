@@ -2,11 +2,16 @@
 set -Eeuo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly LOCK_FILE="${SCRIPT_DIR}/skills.lock"
+readonly REMOTE_LOCK_FILE="${SCRIPT_DIR}/skills.lock"
+readonly BUNDLED_LOCK_FILE="${SCRIPT_DIR}/bundled-skills.lock"
 readonly DEFAULT_TARGET="${HOME}/.agents/skills"
 
 TARGET_DIR="${CODEX_SKILLS_DIR:-$DEFAULT_TARGET}"
 FORCE=0
+
+declare -a SKILL_NAMES=()
+declare -a REMOVE_NAMES=()
+declare -A SEEN_NAMES=()
 
 die() {
   printf '[fav-skills] エラー: %s\n' "$*" >&2
@@ -23,6 +28,16 @@ usage() {
   --target DIR  削除対象のスキルディレクトリを変更する
   -h, --help    このヘルプを表示する
 USAGE
+}
+
+add_skill_name() {
+  local name="$1"
+
+  [[ "$name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "不正なスキル名です: $name"
+  [[ -z "${SEEN_NAMES[$name]+x}" ]] || die "スキル名が重複しています: $name"
+
+  SEEN_NAMES["$name"]=1
+  SKILL_NAMES+=("$name")
 }
 
 while (( $# > 0 )); do
@@ -46,11 +61,24 @@ while (( $# > 0 )); do
   esac
 done
 
-[[ -r "$LOCK_FILE" ]] || die "skills.lockを読み込めません: $LOCK_FILE"
+[[ -r "$REMOTE_LOCK_FILE" ]] || die "skills.lockを読み込めません: $REMOTE_LOCK_FILE"
+[[ -r "$BUNDLED_LOCK_FILE" ]] || die "bundled-skills.lockを読み込めません: $BUNDLED_LOCK_FILE"
 
-removed=0
-while IFS='|' read -r name _owner _gist _revision _filename _extra; do
+while IFS='|' read -r name _owner _gist _revision _filename extra; do
   [[ -z "$name" || "$name" == \#* ]] && continue
+  [[ -z "${extra:-}" ]] || die "skills.lockの列数が不正です: $name"
+  add_skill_name "$name"
+done < "$REMOTE_LOCK_FILE"
+
+while IFS='|' read -r name relative_path extra; do
+  [[ -z "$name" || "$name" == \#* ]] && continue
+  [[ -z "${extra:-}" ]] || die "bundled-skills.lockの列数が不正です: $name"
+  [[ "$relative_path" == "skills/${name}" ]] \
+    || die "同梱スキルのパスが不正です: ${name}|${relative_path}"
+  add_skill_name "$name"
+done < "$BUNDLED_LOCK_FILE"
+
+for name in "${SKILL_NAMES[@]}"; do
   path="${TARGET_DIR}/${name}"
   [[ -e "$path" || -L "$path" ]] || continue
 
@@ -61,11 +89,16 @@ while IFS='|' read -r name _owner _gist _revision _filename _extra; do
       || die "nameを確認できないため削除を停止しました: $path"
   fi
 
+  REMOVE_NAMES+=("$name")
+done
+
+if (( ${#REMOVE_NAMES[@]} == 0 )); then
+  printf '[fav-skills] 削除対象はありません。\n'
+  exit 0
+fi
+
+for name in "${REMOVE_NAMES[@]}"; do
+  path="${TARGET_DIR}/${name}"
   rm -rf -- "$path"
   printf '[fav-skills] 削除しました: %s\n' "$path"
-  removed=1
-done < "$LOCK_FILE"
-
-if (( removed == 0 )); then
-  printf '[fav-skills] 削除対象はありません。\n'
-fi
+done

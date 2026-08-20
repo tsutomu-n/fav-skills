@@ -1,0 +1,7 @@
+interface:
+  display_name: "Tabler Icons"
+  short_description: "実在確認してTabler Iconを選定・実装"
+  default_prompt: "Use $tabler-icons to choose, verify, and implement an accessible Tabler Icon in this project."
+
+policy:
+  allow_implicit_invocation: false
