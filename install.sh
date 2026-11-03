@@ -7,6 +7,7 @@ readonly DEFAULT_TARGET="${HOME}/.agents/skills"
 
 TARGET_DIR="${CODEX_SKILLS_DIR:-$DEFAULT_TARGET}"
 FORCE=0
+ONLY=""
 TMP_DIR=""
 BACKUP_DIR=""
 ROLLBACK=0
@@ -24,10 +25,11 @@ usage() {
 Ubuntu上のCodexユーザースキルをインストールします。
 
 使い方:
-  ./install.sh [--force] [--target DIR]
+  ./install.sh [--force] [--only NAME] [--target DIR]
 
 オプション:
   --force       既存の同名スキルをバックアップして置換する
+  --only NAME   指定したスキルだけをインストールする
   --target DIR  インストール先を変更する
                 既定値: $HOME/.agents/skills
   -h, --help    このヘルプを表示する
@@ -87,6 +89,11 @@ while (( $# > 0 )); do
       TARGET_DIR="$2"
       shift 2
       ;;
+    --only)
+      [[ $# -ge 2 && -n "$2" ]] || die '--onlyにはスキル名を指定してください。'
+      ONLY="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -105,11 +112,16 @@ fi
 
 while IFS='|' read -r name owner gist revision filename extra; do
   [[ -z "$name" || "$name" == \#* ]] && continue
+  [[ -z "$ONLY" || "$name" == "$ONLY" ]] || continue
   [[ -z "${extra:-}" ]] || die "skills.lockの列数が不正です: $name"
   [[ "$name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "不正なスキル名です: $name"
-  [[ "$owner" =~ ^[A-Za-z0-9-]+$ ]] || die "不正なGist所有者です: $owner"
-  [[ "$gist" =~ ^[0-9a-f]{32}$ ]] || die "不正なGist IDです: $gist"
-  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || die "不正なリビジョンです: $revision"
+  if [[ "$owner" == 'local' ]]; then
+    [[ "$gist" == '-' && "$revision" == '-' ]] || die "ローカルスキルの指定が不正です: $name"
+  else
+    [[ "$owner" =~ ^[A-Za-z0-9-]+$ ]] || die "不正なGist所有者です: $owner"
+    [[ "$gist" =~ ^[0-9a-f]{32}$ ]] || die "不正なGist IDです: $gist"
+    [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || die "不正なリビジョンです: $revision"
+  fi
   [[ "$filename" == 'SKILL.md' ]] || die "未対応のファイル名です: $filename"
 
   SKILL_NAMES+=("$name")
@@ -119,10 +131,14 @@ while IFS='|' read -r name owner gist revision filename extra; do
   SKILL_FILES+=("$filename")
 done < "$LOCK_FILE"
 
-(( ${#SKILL_NAMES[@]} > 0 )) || die 'skills.lockにスキルがありません。'
+(( ${#SKILL_NAMES[@]} > 0 )) || die "指定されたスキルがskills.lockにありません: ${ONLY:-全件}"
 
 mkdir -p -- "$TARGET_DIR"
 TARGET_DIR="$(cd -- "$TARGET_DIR" && pwd -P)"
+
+if [[ "$ONLY" == 'cognitive-rhythm-writing' && ! -f "${TARGET_DIR}/japanese-tech-writing/SKILL.md" ]]; then
+  die 'cognitive-rhythm-writingにはjapanese-tech-writingが必要です。先にインストールしてください。'
+fi
 
 for name in "${SKILL_NAMES[@]}"; do
   if [[ -e "${TARGET_DIR}/${name}" || -L "${TARGET_DIR}/${name}" ]]; then
@@ -133,22 +149,20 @@ done
 if (( ${#EXISTING_NAMES[@]} > 0 && FORCE == 0 )); then
   printf '[fav-skills] 次のスキルは既に存在します:\n' >&2
   printf '  - %s\n' "${EXISTING_NAMES[@]}" >&2
-  die '置換する場合は ./install.sh --force を実行してください。'
+  die '置換する場合は対象を確認し、現在のコマンドに --force を追加してください。'
 fi
 
-if command -v curl >/dev/null 2>&1; then
-  download() {
+download() {
+  if command -v curl >/dev/null 2>&1; then
     curl --fail --location --silent --show-error \
       --retry 3 --connect-timeout 10 --max-time 60 \
       --output "$2" "$1"
-  }
-elif command -v wget >/dev/null 2>&1; then
-  download() {
+  elif command -v wget >/dev/null 2>&1; then
     wget --quiet --tries=3 --timeout=60 --output-document="$2" "$1"
-  }
-else
-  die 'curlまたはwgetが必要です。'
-fi
+  else
+    die 'curlまたはwgetが必要です。'
+  fi
+}
 
 validate_skill() {
   local expected_name="$1"
@@ -177,18 +191,26 @@ for index in "${!SKILL_NAMES[@]}"; do
   revision="${SKILL_REVISIONS[$index]}"
   filename="${SKILL_FILES[$index]}"
   skill_dir="${TMP_DIR}/stage/${name}"
-  url="https://gist.githubusercontent.com/${owner}/${gist}/raw/${revision}/${filename}"
+  if [[ "$owner" == 'local' ]]; then
+    source_dir="${SCRIPT_DIR}/skills/${name}"
+    [[ -r "${source_dir}/SKILL.md" && -r "${source_dir}/agents/openai.yaml" ]] \
+      || die "同梱スキルのファイルを読み込めません: $name"
+    log "同梱スキルを準備中: ${name}"
+    cp -R -- "$source_dir" "$skill_dir"
+    validate_skill "$name" "${skill_dir}/SKILL.md"
+  else
+    url="https://gist.githubusercontent.com/${owner}/${gist}/raw/${revision}/${filename}"
+    log "取得中: ${name}@${revision:0:12}"
+    mkdir -p -- "${skill_dir}/agents"
+    download "$url" "${skill_dir}/SKILL.md"
+    validate_skill "$name" "${skill_dir}/SKILL.md"
 
-  log "取得中: ${name}@${revision:0:12}"
-  mkdir -p -- "${skill_dir}/agents"
-  download "$url" "${skill_dir}/SKILL.md"
-  validate_skill "$name" "${skill_dir}/SKILL.md"
-
-  cat > "${skill_dir}/agents/openai.yaml" <<'YAML'
+    cat > "${skill_dir}/agents/openai.yaml" <<'YAML'
 policy:
   allow_implicit_invocation: false
 YAML
-  chmod 0644 "${skill_dir}/SKILL.md" "${skill_dir}/agents/openai.yaml"
+    chmod 0644 "${skill_dir}/SKILL.md" "${skill_dir}/agents/openai.yaml"
+  fi
 done
 
 if [[ -f "${TMP_DIR}/stage/cognitive-rhythm-writing/SKILL.md" ]]; then
@@ -227,8 +249,9 @@ fi
 
 cat <<'NEXT'
 
-Codexを起動中なら再起動し、/skills で確認してください。
-スキルは暗黙には発動しません。プロンプトで明示的に指定します。
+Codexの /skills で認識を確認してください。
+ui-designは関連するUI作業で自動選択される場合があります。
+ライティングスキルはプロンプトで明示的に指定します。
 
   $japanese-tech-writing を使って、この文書を推敲してください。
   $cognitive-rhythm-writing を使って、この解説文のリズムを調整してください。

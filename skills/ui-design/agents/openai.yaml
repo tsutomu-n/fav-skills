@@ -1,0 +1,8 @@
+interface:
+  display_name: UI設計・実装ガイド
+  short_description: 既存実装に合わせ、UI設計方針の整備から画面の実装・レビューまで進める
+  default_prompt: $ui-design を使い、既存の画面・設定を確認して、このプロジェクトに合うUI設計方針と参照ルールを整備してください。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  allow_implicit_invocation: true

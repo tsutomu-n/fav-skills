@@ -7,6 +7,7 @@ readonly DEFAULT_TARGET="${HOME}/.agents/skills"
 
 TARGET_DIR="${CODEX_SKILLS_DIR:-$DEFAULT_TARGET}"
 FORCE=0
+ONLY=""
 
 die() {
   printf '[fav-skills] エラー: %s\n' "$*" >&2
@@ -16,10 +17,11 @@ die() {
 usage() {
   cat <<'USAGE'
 使い方:
-  ./uninstall.sh [--force] [--target DIR]
+  ./uninstall.sh [--force] [--only NAME] [--target DIR]
 
 オプション:
   --force       SKILL.mdのnameを確認できない場合も削除する
+  --only NAME   指定したスキルだけを削除する
   --target DIR  削除対象のスキルディレクトリを変更する
   -h, --help    このヘルプを表示する
 USAGE
@@ -34,6 +36,11 @@ while (( $# > 0 )); do
     --target)
       [[ $# -ge 2 ]] || die '--targetにはディレクトリを指定してください。'
       TARGET_DIR="$2"
+      shift 2
+      ;;
+    --only)
+      [[ $# -ge 2 && -n "$2" ]] || die '--onlyにはスキル名を指定してください。'
+      ONLY="$2"
       shift 2
       ;;
     -h|--help)
@@ -51,6 +58,7 @@ done
 removed=0
 while IFS='|' read -r name _owner _gist _revision _filename _extra; do
   [[ -z "$name" || "$name" == \#* ]] && continue
+  [[ -z "$ONLY" || "$name" == "$ONLY" ]] || continue
   path="${TARGET_DIR}/${name}"
   [[ -e "$path" || -L "$path" ]] || continue
 
